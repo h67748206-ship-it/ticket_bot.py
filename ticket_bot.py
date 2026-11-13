@@ -1,5 +1,5 @@
 """
-ticket_bot.py — Bot de tickets (discord.py 2.x), un seul fichier.
+Bot de tickets (discord.py 2.x), un seul fichier.
 
 Variables d'environnement :
   TOKEN               -> token du bot (obligatoire)
@@ -153,7 +153,7 @@ async def create_ticket(interaction: discord.Interaction, key: str):
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        member: discord.Permissihttps://github.com/h67748206-ship-it/ticket_bot.py/tree/mainonOverwrite(view_channel=True, send_messages=True,
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True,
                                             attach_files=True, read_message_history=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
                                               manage_channels=True, read_message_history=True),
@@ -177,3 +177,126 @@ async def create_ticket(interaction: discord.Interaction, key: str):
         color=COLOR,
         timestamp=datetime.now(timezone.utc),
     )
+    embed.set_footer(text=f"Ticket de {member}")
+    await channel.send(content=member.mention, embed=embed, view=TicketControls())
+
+    # ping du staff (séparé pour ne pas spammer le membre)
+    if staff_role:
+        await channel.send(staff_role.mention, allowed_mentions=discord.AllowedMentions(roles=True))
+
+    await interaction.followup.send(f"✅ Ton ticket est ouvert : {channel.mention}", ephemeral=True)
+
+
+# ------------------------------------------------------------------ PANNEAUX (MENUS)
+def make_options(options):
+    return [discord.SelectOption(label=l, value=k, description=d, emoji=e)
+            for k, l, d, e in options]
+
+
+class PanelSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(custom_id="panel:main", placeholder="Choisir le motif de la demande",
+                         options=make_options(PANEL_OPTIONS), min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await create_ticket(interaction, self.values[0])
+        # reset du menu pour pouvoir re-sélectionner la même option
+        await interaction.message.edit(view=Panel())
+
+
+class Panel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(PanelSelect())
+
+
+# ------------------------------------------------------------------ BOT
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+
+class TicketBot(commands.Bot):
+    async def setup_hook(self):
+        # vues persistantes (marchent même après un redémarrage)
+        self.add_view(Panel())
+        self.add_view(TicketControls())
+
+        # mini site web pour Render / cron-job.org
+        async def home(_):
+            ready = self.user is not None
+            name = str(self.user) if ready else "démarrage..."
+            guilds = len(self.guilds) if ready else 0
+            ping = round(self.latency * 1000) if ready and self.latency == self.latency else 0
+            html = f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ticket Bot</title>
+<style>
+  body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       background:#1e1f22;color:#f2f3f5;font-family:system-ui,sans-serif}}
+  .card{{background:#2b2d31;border-radius:16px;padding:32px 40px;text-align:center;
+        box-shadow:0 8px 30px rgba(0,0,0,.4);max-width:90vw}}
+  h1{{margin:0 0 8px;font-size:26px}}
+  .dot{{display:inline-block;width:10px;height:10px;border-radius:50%;
+       background:{"#23a55a" if ready else "#f0b232"};margin-right:8px}}
+  .row{{margin:6px 0;color:#b5bac1}}
+  b{{color:#f2f3f5}}
+</style></head><body>
+<div class="card">
+  <h1>🎫 Ticket Bot</h1>
+  <div class="row"><span class="dot"></span>{"En ligne" if ready else "Démarrage"}</div>
+  <div class="row">Bot : <b>{name}</b></div>
+  <div class="row">Serveurs : <b>{guilds}</b> &nbsp;•&nbsp; Ping : <b>{ping} ms</b></div>
+</div></body></html>"""
+            return web.Response(text=html, content_type="text/html")
+
+        async def health(_):
+            return web.Response(text="ok")
+
+        app = web.Application()
+        app.add_routes([web.get("/", home), web.get("/health", health)])
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080")))
+        await site.start()
+
+
+bot = TicketBot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+
+@bot.event
+async def on_ready():
+    print(f"Connecté en tant que {bot.user} ({bot.user.id})")
+
+
+@bot.command(name="panel", aliases=["panel_support", "panel_tickets"])
+@commands.has_permissions(administrator=True)
+async def panel(ctx: commands.Context):
+    embed = discord.Embed(
+        title="ℹ️ Besoin d'aide ?",
+        description="> Choisis une option ci-dessous pour ouvrir un ticket privé.",
+        color=COLOR,
+    )
+    await ctx.send(embed=embed, view=Panel())
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("Tu dois être administrateur pour faire ça.", delete_after=5)
+    elif isinstance(error, commands.CommandNotFound):
+        pass
+    else:
+        print("Erreur commande :", error)
+
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("⚠️ Mets ton token dans la variable d'environnement TOKEN.")
+    bot.run(TOKEN)
