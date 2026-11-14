@@ -2,7 +2,6 @@ import asyncio
 import io
 import os
 import re
-from datetime import datetime, timezone
 
 import discord
 from aiohttp import web
@@ -12,7 +11,7 @@ TOKEN = os.getenv("TOKEN", "")
 STAFF_ROLE_ID = int(os.getenv("STAFF_ROLE_ID", "0") or 0)
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0") or 0)
 CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "0") or 0)
-COLOR = 0x5865F2
+BANNER_URL = os.getenv("BANNER_URL", "")
 
 OPTIONS = [
     ("bot", "Problème sur bot", None, "💬"),
@@ -46,7 +45,7 @@ async def transcript(channel):
     lines = []
     async for msg in channel.history(limit=None, oldest_first=True):
         ts = msg.created_at.strftime("%d/%m/%Y %H:%M")
-        text = msg.content or ("[embed]" if msg.embeds else "")
+        text = msg.content or "[message du bot]"
         for a in msg.attachments:
             text += " [fichier: " + a.url + "]"
         lines.append("[" + ts + "] " + str(msg.author) + " : " + text)
@@ -54,10 +53,8 @@ async def transcript(channel):
     return discord.File(io.BytesIO(data), filename="transcript-" + channel.name + ".txt")
 
 
-class TicketControls(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
+# ---------------------------------------------------------------- TICKET
+class TicketRow(discord.ui.ActionRow):
     @discord.ui.button(label="Prendre en charge", style=discord.ButtonStyle.success,
                        emoji="🙋", custom_id="ticket:claim")
     async def claim(self, interaction, button):
@@ -66,7 +63,7 @@ class TicketControls(discord.ui.View):
             return
         button.disabled = True
         button.label = "Pris par " + interaction.user.display_name
-        await interaction.response.edit_message(view=self)
+        await interaction.response.edit_message(view=self.view)
         await interaction.channel.send("✅ " + interaction.user.mention + " s'occupe de ce ticket.")
 
     @discord.ui.button(label="Fermer", style=discord.ButtonStyle.danger,
@@ -83,7 +80,7 @@ class TicketControls(discord.ui.View):
             if log:
                 try:
                     f = await transcript(channel)
-                    embed = discord.Embed(title="Ticket fermé", color=COLOR)
+                    embed = discord.Embed(title="Ticket fermé", color=0x5865F2)
                     embed.add_field(name="Salon", value="#" + channel.name)
                     embed.add_field(name="Fermé par", value=interaction.user.mention)
                     if owner:
@@ -96,6 +93,20 @@ class TicketControls(discord.ui.View):
             await channel.delete()
         except discord.HTTPException:
             pass
+
+
+class TicketView(discord.ui.LayoutView):
+    def __init__(self, label="Ticket", member=None):
+        super().__init__(timeout=None)
+        who = member.mention if member else ""
+        container = discord.ui.Container(
+            discord.ui.TextDisplay("## 🎫 Ticket — " + label),
+            discord.ui.TextDisplay("> Salut " + who + " ! Explique ton problème ou ta demande ici, "
+                                   "le staff va te répondre dès que possible."),
+            discord.ui.Separator(),
+            TicketRow(),
+        )
+        self.add_item(container)
 
 
 async def create_ticket(interaction, key):
@@ -134,44 +145,47 @@ async def create_ticket(interaction, key):
         topic="ticket_owner:" + str(member.id) + " | type:" + label,
     )
 
-    embed = discord.Embed(
-        title="🎫 Ticket — " + label,
-        description="Salut " + member.mention + " ! Explique ton problème ou ta demande ici, "
-                    "le staff va te répondre dès que possible.",
-        color=COLOR,
-    )
-    await channel.send(content=member.mention, embed=embed, view=TicketControls())
-    if staff_role:
-        await channel.send(staff_role.mention, allowed_mentions=discord.AllowedMentions(roles=True))
+    await channel.send(view=TicketView(label, member))
+    pings = member.mention + (" " + staff_role.mention if staff_role else "")
+    await channel.send(pings, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
     await interaction.followup.send("✅ Ton ticket est ouvert : " + channel.mention, ephemeral=True)
 
 
-class PanelSelect(discord.ui.Select):
-    def __init__(self):
-        opts = [discord.SelectOption(label=l, value=k, description=d, emoji=e)
-                for k, l, d, e in OPTIONS]
-        super().__init__(custom_id="panel:main", placeholder="Choisir le motif de la demande",
-                         options=opts, min_values=1, max_values=1)
-
-    async def callback(self, interaction):
+# ---------------------------------------------------------------- PANNEAU
+class PanelRow(discord.ui.ActionRow):
+    @discord.ui.select(
+        custom_id="panel:main",
+        placeholder="Choisir le motif de la demande",
+        min_values=1, max_values=1,
+        options=[discord.SelectOption(label=l, value=k, description=d, emoji=e)
+                 for k, l, d, e in OPTIONS],
+    )
+    async def pick(self, interaction, select):
         await interaction.response.defer(ephemeral=True)
         try:
-            await create_ticket(interaction, self.values[0])
+            await create_ticket(interaction, select.values[0])
         except Exception as e:
             print("Erreur ticket :", e)
             await interaction.followup.send("Erreur : vérifie les permissions du bot.", ephemeral=True)
         try:
-            await interaction.message.edit(view=Panel())
+            await interaction.message.edit(view=PanelView())
         except discord.HTTPException:
             pass
 
 
-class Panel(discord.ui.View):
+class PanelView(discord.ui.LayoutView):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(PanelSelect())
+        items = []
+        if BANNER_URL:
+            items.append(discord.ui.MediaGallery(discord.MediaGalleryItem(BANNER_URL)))
+        items.append(discord.ui.TextDisplay("## ℹ️ Besoin d'aide ?"))
+        items.append(discord.ui.TextDisplay("> Choisis une option ci-dessous pour ouvrir un ticket privé."))
+        items.append(PanelRow())
+        self.add_item(discord.ui.Container(*items))
 
 
+# ---------------------------------------------------------------- BOT
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -179,8 +193,8 @@ intents.members = True
 
 class TicketBot(commands.Bot):
     async def setup_hook(self):
-        self.add_view(Panel())
-        self.add_view(TicketControls())
+        self.add_view(PanelView())
+        self.add_view(TicketView())
 
         async def home(request):
             ready = self.user is not None
@@ -219,12 +233,7 @@ async def on_ready():
 @bot.command(name="panel", aliases=["panel_support", "panel_tickets"])
 @commands.has_permissions(administrator=True)
 async def panel(ctx):
-    embed = discord.Embed(
-        title="ℹ️ Besoin d'aide ?",
-        description="> Choisis une option ci-dessous pour ouvrir un ticket privé.",
-        color=COLOR,
-    )
-    await ctx.send(embed=embed, view=Panel())
+    await ctx.send(view=PanelView())
     try:
         await ctx.message.delete()
     except discord.HTTPException:
