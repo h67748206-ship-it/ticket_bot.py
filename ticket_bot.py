@@ -5,7 +5,7 @@ Requirements : discord.py>=2.6  aiohttp
 Variables d'environnement : TOKEN (obligatoire), PORT (Render), LTC_ADDRESS (optionnel),
                             LTC_API (optionnel), DB_PATH (optionnel, chemin de la base)
 
-NOUVEAUTÉS v3
+NOUVEAUTÉS v3 (+ TOUT se contrôle depuis /config : emplacements, produits, textes, vouchs, tickets, stats, blacklist, sauvegarde)
 - Panneau de tickets "grand format" (bannière + titre + texte + menu de catégories), style Components V2
 - /config : GRAND PANNEAU de configuration (rôles, ping des tickets, salons, apparence du panneau,
   catégories du menu, paiement LTC + test, options) -> plus besoin de taper des commandes
@@ -19,6 +19,7 @@ NOUVEAUTÉS v3
 Automatismes conservés : /creer_shop, paiement LTC automatique, auto-claim, fermeture auto, restock, stats.
 """
 import io
+import json
 import os
 import random
 import re
@@ -63,6 +64,20 @@ DEFAULT_PANEL_DESC = (
     "📩 Sélectionne une catégorie dans le menu ci-dessous pour ouvrir un ticket."
 )
 DEFAULT_TICKET_WELCOME = "Explique ce que tu veux, un vendeur arrive très vite.\nUtilise les boutons ci-dessous."
+DEFAULT_DELIVERED = "Merci pour ton achat !\nLaisse un vouch avec le bouton ci-dessous (ou `/vouch`)."
+DEFAULT_PAID = "Un vendeur va te livrer ta commande.\n\n⭐ Laisse ton vouch avec le bouton ci-dessous, il sera posté dans le salon des vouchs."
+DEFAULT_WELCOME = ("Ici tu trouves nos produits digitaux.\n\n🛒 Pour acheter : ouvre un ticket dans {achat}\n"
+                   "✅ Les avis de nos clients : {vouchs}\n📜 Lis le règlement avant de commander.")
+DEFAULT_RULES = (
+    "**1.** Respecte les membres et le staff.\n"
+    "**2.** Pas de spam, pas de pub, pas d'insultes.\n"
+    "**3.** Les achats se font **uniquement via un ticket**. Ne fais confiance à aucun message privé, "
+    "seul le staff dans ton ticket peut te vendre quelque chose.\n"
+    "**4.** Paie uniquement avec les moyens donnés par le bot dans ton ticket, en envoyant le montant exact.\n"
+    "**5.** Garde tes preuves (captures, txid) en cas de problème.\n"
+    "**6.** Après ta commande, laisse un vouch, ça aide tout le monde.\n\n"
+    "_Le staff peut sanctionner en cas de non-respect._"
+)
 
 
 # ═════════════════════════ Base de données (1 connexion, WAL, cache config) ═════════════════════════
@@ -163,11 +178,36 @@ init_db()
 
 
 # ═════════════════════════ Helpers ═════════════════════════
+def staff_role_ids():
+    ids = set(id_list("staff_roles"))
+    if cfg_int("staff_role"):
+        ids.add(cfg_int("staff_role"))
+    return ids
+
+
+def staff_roles(guild):
+    return [r for r in (guild.get_role(x) for x in staff_role_ids()) if r]
+
+
 def is_staff(member: discord.Member) -> bool:
     if member.guild_permissions.administrator:
         return True
-    rid = cfg_int("staff_role")
-    return bool(rid) and any(r.id == rid for r in member.roles)
+    ids = staff_role_ids()
+    return bool(ids) and any(r.id in ids for r in member.roles)
+
+
+def cfg_num(key, default):
+    try:
+        return float(cfg_get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def render(text, **kw):
+    """Remplace {variables} dans un texte personnalisé (sans planter sur les autres accolades)."""
+    for k, v in kw.items():
+        text = text.replace("{" + k + "}", str(v))
+    return text
 
 
 def is_blacklisted(user_id: int) -> bool:
@@ -458,8 +498,9 @@ def check_vouch(member: discord.Member):
         if rid and not any(r.id == rid for r in member.roles):
             return "Il faut avoir acheté au shop (rôle client) pour laisser un vouch."
     last = q("SELECT ts FROM vouches WHERE author_id=? ORDER BY ts DESC LIMIT 1", (member.id,), one=True)
-    if last and time.time() - last["ts"] < VOUCH_COOLDOWN:
-        reste = int((VOUCH_COOLDOWN - (time.time() - last["ts"])) // 3600) + 1
+    cd = cfg_num("vouch_cooldown_h", 12) * 3600
+    if cd and last and time.time() - last["ts"] < cd:
+        reste = int((cd - (time.time() - last["ts"])) // 3600) + 1
         return f"Tu as déjà vouch récemment, réessaie dans ~{reste}h."
     return None
 
@@ -479,7 +520,7 @@ async def post_vouch(guild, author, target_id, stars, text, product=None):
     emb.set_footer(text=f"{SHOP_NAME} • {total} vouch(s)")
     ch = vouch_channel(guild)
     if not ch:
-        return vid, None, "aucun salon des vouchs configuré (un admin doit faire `/config` → Salons)"
+        return vid, None, "aucun salon des vouchs configuré (un admin doit faire `/config` → Emplacements)"
     try:
         return vid, await ch.send(embed=emb), None
     except discord.HTTPException as e:
@@ -572,9 +613,11 @@ async def create_ticket(i: discord.Interaction, cat_id: int):
     prod = q("SELECT * FROM products WHERE name=?", (cat["product"],), one=True) if cat["product"] else None
     if prod and prod["stock"] == 0:
         return await i.response.send_message(f"❌ **{prod['name']}** est en rupture de stock pour le moment.", ephemeral=True)
-    for r in q("SELECT channel_id FROM orders WHERE user_id=? AND status IN ('open','claimed') AND channel_id!=0", (i.user.id,)):
-        if g.get_channel(r["channel_id"]):
-            return await i.response.send_message(f"Tu as déjà un ticket ouvert : <#{r['channel_id']}>", ephemeral=True)
+    mine = [r["channel_id"] for r in q("SELECT channel_id FROM orders WHERE user_id=? AND status IN ('open','claimed') AND channel_id!=0",
+                                       (i.user.id,)) if g.get_channel(r["channel_id"])]
+    limit = int(cfg_num("max_tickets", 1))
+    if limit and len(mine) >= limit:
+        return await i.response.send_message("Tu as déjà un ticket ouvert : " + " ".join(f"<#{c}>" for c in mine), ephemeral=True)
 
     await i.response.defer(ephemeral=True)
     ow = {
@@ -582,8 +625,7 @@ async def create_ticket(i: discord.Interaction, cat_id: int):
         i.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
         g.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
     }
-    srole = g.get_role(cfg_int("staff_role") or 0)
-    if srole:
+    for srole in staff_roles(g):
         ow[srole] = discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True)
     parent = g.get_channel(cfg_int("ticket_category") or 0)
     try:
@@ -596,7 +638,8 @@ async def create_ticket(i: discord.Interaction, cat_id: int):
 
     emb = discord.Embed(
         title=f"🎫 Ticket #{oid} — {cat['label']}",
-        description=cfg_get("ticket_welcome") or DEFAULT_TICKET_WELCOME,
+        description=render(cfg_get("ticket_welcome") or DEFAULT_TICKET_WELCOME, user=i.user.mention, category=cat["label"],
+                           product=prod["name"] if prod else cat["label"], shop=SHOP_NAME),
         color=accent(), timestamp=discord.utils.utcnow(),
     )
     emb.add_field(name="Ouvert par", value=i.user.mention)
@@ -696,8 +739,8 @@ class TicketControls(discord.ui.View):
         auto = cfg_get("auto_close_delivered", "1") == "1"
         emb = discord.Embed(
             title="✅ Commande livrée",
-            description="Merci pour ton achat !\nLaisse un vouch avec le bouton ci-dessous (ou `/vouch`)."
-                        + ("\n_Ce ticket sera fermé automatiquement dans 30 minutes._" if auto else ""),
+            description=render(cfg_get("delivered_text") or DEFAULT_DELIVERED, user=f"<@{o['user_id']}>", product=o["product"], shop=SHOP_NAME)
+                        + (f"\n_Ce ticket sera fermé automatiquement dans {int(cfg_num('delivered_close_min', 30))} minutes._" if auto else ""),
             color=0x22C55E)
         await i.response.send_message(content=f"<@{o['user_id']}>", embed=emb, view=VouchView(),
                                       allowed_mentions=discord.AllowedMentions(users=True))
@@ -708,6 +751,14 @@ class TicketControls(discord.ui.View):
                 pass
         await send_log(i.guild, embed=discord.Embed(
             title="Commande livrée", description=f"#{o['id']} • {o['product']} • <@{o['user_id']}> • par {i.user.mention}", color=0x22C55E))
+        sales = cfg_channel(i.guild, "sales_channel")
+        if sales:
+            try:
+                await sales.send(embed=discord.Embed(
+                    title="🛒 Nouvelle vente", description=f"**{o['product']}** livré à <@{o['user_id']}> par {i.user.mention}",
+                    color=0x22C55E, timestamp=discord.utils.utcnow()), allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                pass
         await refresh_shop(i.guild)
 
     @discord.ui.button(label="Fermer", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="shop:close", row=0)
@@ -747,16 +798,15 @@ async def on_paid(ch, o, txid):
             await buyer.add_roles(g.get_role(rid), reason="Paiement LTC reçu")
     except discord.HTTPException:
         pass
-    srid = cfg_int("staff_role")
+    sroles = staff_roles(g)
     emb = discord.Embed(
         title="✅ Paiement reçu !",
-        description=(f"**{o['ltc_amount'] / 1e8:.8f} LTC** confirmés sur la blockchain.\n"
-                     "Un vendeur va te livrer ta commande.\n\n"
-                     "⭐ Laisse ton vouch avec le bouton ci-dessous, il sera posté dans le salon des vouchs."),
+        description=f"**{o['ltc_amount'] / 1e8:.8f} LTC** confirmés sur la blockchain.\n"
+                    + render(cfg_get("paid_text") or DEFAULT_PAID, user=f"<@{o['user_id']}>", product=o["product"], shop=SHOP_NAME),
         color=0x22C55E)
     emb.add_field(name="Transaction", value=f"[Voir sur la blockchain](https://blockchair.com/litecoin/transaction/{txid})")
-    await ch.send(content=f"<@{o['user_id']}>" + (f" <@&{srid}>" if srid else ""), embed=emb, view=VouchView(),
-                  allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+    await ch.send(content=" ".join([f"<@{o['user_id']}>"] + [r.mention for r in sroles]), embed=emb, view=VouchView(),
+                  allowed_mentions=discord.AllowedMentions(users=True, roles=sroles))
     await send_log(g, embed=discord.Embed(
         title="💰 Paiement LTC reçu",
         description=f"Ticket {ch.mention} • <@{o['user_id']}> • {o['product']}\n{o['ltc_amount'] / 1e8:.8f} LTC ({o['ltc_eur']:.2f} €)\n`{txid}`",
@@ -799,6 +849,21 @@ class ConfigView(discord.ui.View):
     async def refresh(self, i: discord.Interaction):
         await i.response.edit_message(embed=self.embed(i.guild), view=self)
 
+    def add_toggles(self, opts, row=0):
+        """Ajoute des boutons on/off. opts = [(clé, texte, valeur par défaut "0"/"1")]. La page doit pouvoir se recréer sans argument."""
+        for n, (key, label, default) in enumerate(opts):
+            on = cfg_get(key, default) == "1"
+            b = discord.ui.Button(label=f"{'✅' if on else '❌'} {label}"[:80], row=row + n // 2,
+                                  style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary)
+            b.callback = self._toggle_cb(key, default)
+            self.add_item(b)
+
+    def _toggle_cb(self, key, default):
+        async def cb(i: discord.Interaction):
+            cfg_set(key, "0" if cfg_get(key, default) == "1" else "1")
+            await go(i, type(self)())
+        return cb
+
 
 class Page(ConfigView):
     def back_view(self):
@@ -809,53 +874,73 @@ class Page(ConfigView):
         await go(i, self.back_view())
 
 
+def fmt_staff(g):
+    return " ".join(r.mention for r in staff_roles(g)) or "❌ aucun"
+
+
 class MainView(ConfigView):
     def embed(self, g):
-        n = q("SELECT COUNT(*) n FROM categories", one=True)["n"]
-        posted = cfg_channel(g, "panel_channel")
+        nc = q("SELECT COUNT(*) n FROM categories", one=True)["n"]
+        npd = q("SELECT COUNT(*) n FROM products", one=True)["n"]
         emb = discord.Embed(
             title=f"⚙️ Configuration de {SHOP_NAME}", color=accent(),
-            description="Choisis une section avec les boutons ci-dessous. Tout se met à jour **tout seul** dans le panneau et les tickets.")
-        emb.add_field(name="🎭 Rôles", value=f"Staff : {fmt_role(g, cfg_get('staff_role'))}\nPing tickets : {fmt_roles(g, 'ticket_ping_roles')}\n"
-                                              f"Client : {fmt_role(g, cfg_get('client_role'))}\nRestock : {fmt_role(g, cfg_get('ping_role'))}")
-        emb.add_field(name="📺 Salons", value=f"Vouchs : {fmt_chan(g, 'vouch_channel')}\nLogs : {fmt_chan(g, 'logs_channel')}\n"
-                                               f"Restock : {fmt_chan(g, 'annonces_channel')}\nTickets : {fmt_chan(g, 'ticket_category')}")
-        emb.add_field(name="💳 Paiement", value=f"LTC : {'✅ configuré' if ltc_address() else '❌ non configuré'}", inline=False)
-        emb.add_field(name="🗂️ Panneau", value=f"{n} catégorie(s) • " + (f"posté dans {posted.mention}" if posted else "pas encore posté"), inline=False)
+            description="Tout se règle ici, les changements s'appliquent tout de suite. Choisis une section avec les boutons.")
+        emb.add_field(name="🎭 Rôles", value=(f"Staff : {fmt_staff(g)}\nPing tickets : {fmt_roles(g, 'ticket_ping_roles')}\n"
+                                              f"Client : {fmt_role(g, cfg_get('client_role'))}\nRestock : {fmt_role(g, cfg_get('ping_role'))}"))
+        emb.add_field(name="📍 Emplacements", value="\n".join(
+            [f"{nm} : {fmt_chan(g, ck)}" for nm, ck, _ in POSTS.values()]
+            + [f"{nm.split(' (')[0]} : {fmt_chan(g, ck)}" for nm, ck in FEEDS.values()]))
+        emb.add_field(name="🛍️ Boutique", value=f"{npd} produit(s) • {nc} catégorie(s)\nLTC : {'✅ configuré' if ltc_address() else '❌ non configuré'}",
+                      inline=False)
         return emb
 
     @discord.ui.button(label="Rôles", emoji="🎭", style=discord.ButtonStyle.primary, row=0)
     async def roles(self, i, b):
         await go(i, RolesPage())
 
-    @discord.ui.button(label="Salons", emoji="📺", style=discord.ButtonStyle.primary, row=0)
-    async def channels(self, i, b):
-        await go(i, ChannelsPage())
+    @discord.ui.button(label="Emplacements", emoji="📍", style=discord.ButtonStyle.primary, row=0)
+    async def places(self, i, b):
+        await go(i, PlacesPage())
 
     @discord.ui.button(label="Apparence", emoji="🎨", style=discord.ButtonStyle.primary, row=0)
     async def look(self, i, b):
         await go(i, LookPage())
 
-    @discord.ui.button(label="Catégories", emoji="🗂️", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="Textes", emoji="💬", style=discord.ButtonStyle.primary, row=0)
+    async def texts(self, i, b):
+        await go(i, TextsPage())
+
+    @discord.ui.button(label="Catégories", emoji="🗂️", style=discord.ButtonStyle.primary, row=0)
     async def cats(self, i, b):
         await go(i, CategoriesPage())
+
+    @discord.ui.button(label="Produits", emoji="🛍️", style=discord.ButtonStyle.primary, row=1)
+    async def products(self, i, b):
+        await go(i, ProductsPage())
 
     @discord.ui.button(label="Paiement", emoji="💳", style=discord.ButtonStyle.primary, row=1)
     async def pay(self, i, b):
         await go(i, PaymentPage())
 
-    @discord.ui.button(label="Options", emoji="🔧", style=discord.ButtonStyle.primary, row=1)
-    async def opts(self, i, b):
-        await go(i, OptionsPage())
+    @discord.ui.button(label="Vouchs", emoji="⭐", style=discord.ButtonStyle.primary, row=1)
+    async def vouchs(self, i, b):
+        await go(i, VouchPage())
 
-    @discord.ui.button(label="Poster le panneau ici", emoji="📤", style=discord.ButtonStyle.success, row=2)
-    async def post(self, i: discord.Interaction, b):
-        await i.response.defer(ephemeral=True)
-        try:
-            await post_panel(i.channel)
-            await i.followup.send(f"✅ Panneau posté dans {i.channel.mention}.", ephemeral=True)
-        except discord.HTTPException as e:
-            await i.followup.send(f"❌ Impossible de poster ici : {e.text or e}", ephemeral=True)
+    @discord.ui.button(label="Tickets", emoji="🎫", style=discord.ButtonStyle.primary, row=1)
+    async def tickets(self, i, b):
+        await go(i, TicketsPage())
+
+    @discord.ui.button(label="Stats", emoji="📊", style=discord.ButtonStyle.primary, row=1)
+    async def stats(self, i, b):
+        await go(i, StatsPage())
+
+    @discord.ui.button(label="Blacklist", emoji="⛔", style=discord.ButtonStyle.secondary, row=2)
+    async def blacklist(self, i, b):
+        await go(i, BlacklistPage())
+
+    @discord.ui.button(label="Sauvegarde", emoji="💾", style=discord.ButtonStyle.secondary, row=2)
+    async def backup(self, i, b):
+        await go(i, BackupPage())
 
     @discord.ui.button(label="Créer tout le shop", emoji="🏗️", style=discord.ButtonStyle.success, row=2)
     async def build(self, i: discord.Interaction, b):
@@ -866,15 +951,16 @@ class RolesPage(Page):
     def embed(self, g):
         emb = discord.Embed(title="🎭 Rôles", color=accent(),
                             description="Sélectionne les rôles dans les menus ci-dessous.")
-        emb.add_field(name="👮 Staff (voit et gère les tickets)", value=fmt_role(g, cfg_get("staff_role")), inline=False)
+        emb.add_field(name="👮 Staff (voit et gère les tickets)", value=fmt_staff(g), inline=False)
         emb.add_field(name="🔔 Rôles pingés à l'ouverture d'un ticket", value=fmt_roles(g, "ticket_ping_roles"), inline=False)
         emb.add_field(name="🧾 Rôle client (donné au paiement / à la livraison)", value=fmt_role(g, cfg_get("client_role")), inline=False)
         emb.add_field(name="📦 Rôle ping restock", value=fmt_role(g, cfg_get("ping_role")), inline=False)
         return emb
 
-    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="👮 Rôle staff", row=0)
+    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="👮 Rôles staff (jusqu'à 5)", min_values=1, max_values=5, row=0)
     async def staff(self, i, sel):
-        cfg_set("staff_role", sel.values[0].id)
+        cfg_set("staff_roles", ",".join(str(r.id) for r in sel.values))
+        cfg_del("staff_role")
         await self.refresh(i)
 
     @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="🔔 Rôles à ping à l'ouverture d'un ticket", min_values=0, max_values=5, row=1)
@@ -893,34 +979,119 @@ class RolesPage(Page):
         await self.refresh(i)
 
 
-class ChannelsPage(Page):
+POSTS = {  # élément -> (nom, clé du salon, clé du message)
+    "panel": ("🎫 Panneau de tickets", "panel_channel", "panel_msg"),
+    "catalogue": ("📦 Catalogue", "catalogue_channel", "catalogue_msg"),
+    "welcome": ("👋 Message de bienvenue", "welcome_channel", "welcome_msg"),
+    "rules": ("📜 Règlement", "rules_channel", "rules_msg"),
+}
+FEEDS = {  # élément -> (nom, clé du salon)
+    "vouch": ("✅ Vouchs", "vouch_channel"),
+    "sales": ("💰 Ventes (annonce à chaque livraison)", "sales_channel"),
+    "logs": ("📁 Logs (transcripts, paiements)", "logs_channel"),
+    "annonces": ("📢 Annonces restock", "annonces_channel"),
+    "tickets": ("🎫 Catégorie des tickets", "ticket_category"),
+}
+
+
+def rules_embed():
+    return discord.Embed(title="📜 Règlement", description=cfg_get("rules_text") or DEFAULT_RULES, color=accent())
+
+
+def welcome_embed(g):
+    achat = f"<#{cfg_int('panel_channel')}>" if cfg_int("panel_channel") else "le salon d'achat"
+    vouchs = f"<#{cfg_int('vouch_channel')}>" if cfg_int("vouch_channel") else "le salon des vouchs"
+    return discord.Embed(title=f"👋 Bienvenue sur {SHOP_NAME} !", color=accent(),
+                         description=render(cfg_get("welcome_text") or DEFAULT_WELCOME, shop=SHOP_NAME, achat=achat, vouchs=vouchs))
+
+
+async def publish(g, item):
+    """Poste ou met à jour le message d'un élément dans son salon."""
+    if item == "panel":
+        await _upsert(g, "panel_channel", "panel_msg", **panel_kwargs())
+    elif item == "catalogue":
+        await _upsert(g, "catalogue_channel", "catalogue_msg", embed=catalogue_embed())
+    elif item == "welcome":
+        await _upsert(g, "welcome_channel", "welcome_msg", embed=welcome_embed(g))
+    elif item == "rules":
+        await _upsert(g, "rules_channel", "rules_msg", embed=rules_embed())
+
+
+async def move_post(g, item, ch):
+    """Déplace un message du bot dans un autre salon (supprime l'ancien et republie)."""
+    _, ckey, mkey = POSTS[item]
+    old, mid = cfg_channel(g, ckey), cfg_int(mkey)
+    if old and mid and old.id != ch.id:
+        try:
+            await (await old.fetch_message(mid)).delete()
+        except discord.HTTPException:
+            pass
+    if old is None or old.id != ch.id:
+        cfg_del(mkey)
+    cfg_set(ckey, ch.id)
+    await publish(g, item)
+
+
+class PlacesPage(Page):
+    def __init__(self):
+        super().__init__()
+        self.item = None
+        opts = [discord.SelectOption(label=v[0][:100], value=f"post:{k}", description="Message posté dans le salon choisi")
+                for k, v in POSTS.items()]
+        opts += [discord.SelectOption(label=v[0][:100], value=f"feed:{k}", description="Salon utilisé par le bot")
+                 for k, v in FEEDS.items()]
+        sel = discord.ui.Select(placeholder="1️⃣ Que veux-tu placer ?", options=opts, row=0)
+
+        async def pick(i: discord.Interaction):
+            self.item = i.data["values"][0]
+            await self.refresh(i)
+        sel.callback = pick
+        self.add_item(sel)
+
     def embed(self, g):
-        emb = discord.Embed(title="📺 Salons", color=accent(), description="Sélectionne les salons dans les menus ci-dessous.")
-        emb.add_field(name="✅ Salon des vouchs", value=fmt_chan(g, "vouch_channel"), inline=False)
-        emb.add_field(name="📁 Salon des logs (transcripts, paiements)", value=fmt_chan(g, "logs_channel"), inline=False)
-        emb.add_field(name="📢 Salon des annonces restock", value=fmt_chan(g, "annonces_channel"), inline=False)
-        emb.add_field(name="🎫 Catégorie où les tickets sont créés", value=fmt_chan(g, "ticket_category"), inline=False)
+        emb = discord.Embed(
+            title="📍 Emplacements", color=accent(),
+            description="Choisis **ce que tu veux placer** (menu 1), puis **le salon** (menu 2). "
+                        "Les messages du bot sont déplacés et republiés tout de suite.")
+        emb.add_field(name="Messages du bot", value="\n".join(f"{nm} → {fmt_chan(g, ck)}" for nm, ck, _ in POSTS.values()), inline=False)
+        emb.add_field(name="Salons utilisés", value="\n".join(f"{nm} → {fmt_chan(g, ck)}" for nm, ck in FEEDS.values()), inline=False)
+        if self.item:
+            kind, key = self.item.split(":")
+            emb.add_field(name="Sélection", value=f"{(POSTS if kind == 'post' else FEEDS)[key][0]}\nChoisis maintenant le salon (menu 2).", inline=False)
         return emb
 
-    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="✅ Salon des vouchs", row=0)
-    async def vouch(self, i, sel):
-        cfg_set("vouch_channel", sel.values[0].id)
-        await self.refresh(i)
+    @discord.ui.select(cls=discord.ui.ChannelSelect, placeholder="2️⃣ Où ? Choisis le salon",
+                       channel_types=[discord.ChannelType.text, discord.ChannelType.news, discord.ChannelType.category], row=1)
+    async def where(self, i: discord.Interaction, sel):
+        if not self.item:
+            return await i.response.send_message("Choisis d'abord ce que tu veux placer (menu 1).", ephemeral=True)
+        kind, key = self.item.split(":")
+        g = i.guild
+        ch = g.get_channel(sel.values[0].id)
+        if ch is None:
+            return await i.response.send_message("Je ne vois pas ce salon (permissions du bot ?).", ephemeral=True)
+        is_cat = ch.type == discord.ChannelType.category
+        if key == "tickets" and not is_cat:
+            return await i.response.send_message("Pour les tickets, choisis une **catégorie** (un dossier), pas un salon.", ephemeral=True)
+        if key != "tickets" and is_cat:
+            return await i.response.send_message("Choisis un **salon texte**, pas une catégorie.", ephemeral=True)
+        await i.response.defer()
+        try:
+            if kind == "post":
+                await move_post(g, key, ch)
+            else:
+                cfg_set(FEEDS[key][1], ch.id)
+        except discord.HTTPException as e:
+            await i.followup.send(f"❌ Impossible de poster dans {ch.mention} : {e.text or e}", ephemeral=True)
+        await i.edit_original_response(embed=self.embed(g), view=self)
 
-    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="📁 Salon des logs", row=1)
-    async def logs(self, i, sel):
-        cfg_set("logs_channel", sel.values[0].id)
-        await self.refresh(i)
-
-    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="📢 Salon des annonces restock", row=2)
-    async def annonces(self, i, sel):
-        cfg_set("annonces_channel", sel.values[0].id)
-        await self.refresh(i)
-
-    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.category], placeholder="🎫 Catégorie des tickets", row=3)
-    async def tickets(self, i, sel):
-        cfg_set("ticket_category", sel.values[0].id)
-        await self.refresh(i)
+    @discord.ui.button(label="Tout republier", emoji="🔄", style=discord.ButtonStyle.primary, row=2)
+    async def repub(self, i: discord.Interaction, b):
+        await i.response.defer(ephemeral=True)
+        for item, (_, ck, _) in POSTS.items():
+            if cfg_channel(i.guild, ck):
+                await publish(i.guild, item)
+        await i.followup.send("✅ Messages mis à jour.", ephemeral=True)
 
 
 class PanelLookModal(discord.ui.Modal, title="Apparence du panneau"):
@@ -1127,31 +1298,387 @@ class PaymentPage(Page):
         await i.followup.send(await ltc_selftest(), ephemeral=True)
 
 
-class OptionsPage(Page):
-    OPTS = [
-        ("vouch_client_only", "Vouch réservé aux clients", "0"),
+class NumbersModal(discord.ui.Modal):
+    """Modale générique pour régler des nombres. fields = [(clé, texte, défaut)], back = classe de la page de retour."""
+
+    def __init__(self, title, fields, back):
+        super().__init__(title=title[:45])
+        self.back = back
+        self.items = []
+        for key, label, default in fields:
+            ti = discord.ui.TextInput(label=label[:45], default=f"{cfg_num(key, default):g}", max_length=8)
+            self.add_item(ti)
+            self.items.append((key, ti))
+
+    async def on_submit(self, i: discord.Interaction):
+        vals = {}
+        for key, ti in self.items:
+            try:
+                v = float(ti.value.strip().replace(",", "."))
+                assert v >= 0
+            except (ValueError, AssertionError):
+                return await i.response.send_message(f"❌ « {ti.label} » doit être un nombre positif.", ephemeral=True)
+            vals[key] = v
+        for k, v in vals.items():
+            cfg_set(k, f"{v:g}")
+        page = self.back()
+        await i.response.edit_message(embed=page.embed(i.guild), view=page)
+
+
+class TicketsPage(Page):
+    TOGGLES = [
         ("ping_on_open", "Pinger les rôles à l'ouverture", "1"),
-        ("auto_close_delivered", "Fermer le ticket 30 min après livraison", "1"),
-        ("dm_transcript", "Envoyer le transcript en DM", "1"),
+        ("auto_claim", "Claim auto au 1er message du staff", "1"),
+        ("auto_close_delivered", "Fermer le ticket après livraison", "1"),
+        ("dm_transcript", "Transcript en DM à la fermeture", "1"),
     ]
 
     def __init__(self):
         super().__init__()
-        for n, (key, label, default) in enumerate(self.OPTS):
-            on = cfg_get(key, default) == "1"
-            b = discord.ui.Button(label=f"{'✅' if on else '❌'} {label}", row=n // 2,
-                                  style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary)
-            b.callback = self._make(key, default)
-            self.add_item(b)
-
-    def _make(self, key, default):
-        async def cb(i: discord.Interaction):
-            cfg_set(key, "0" if cfg_get(key, default) == "1" else "1")
-            await go(i, OptionsPage())
-        return cb
+        self.add_toggles(self.TOGGLES, row=0)
 
     def embed(self, g):
-        return discord.Embed(title="🔧 Options", color=accent(), description="Clique pour activer / désactiver.")
+        emb = discord.Embed(title="🎫 Tickets", color=accent(), description="Clique sur un bouton pour activer / désactiver.")
+        emb.add_field(name="Fermeture après livraison", value=f"{cfg_num('delivered_close_min', 30):g} min")
+        emb.add_field(name="Fermeture si inactif", value=("jamais" if not cfg_num("inactive_close_h", 48) else f"{cfg_num('inactive_close_h', 48):g} h"))
+        emb.add_field(name="Tickets max par membre", value=("illimité" if not cfg_num("max_tickets", 1) else f"{cfg_num('max_tickets', 1):g}"))
+        return emb
+
+    @discord.ui.button(label="Délais et limites", emoji="⏱️", style=discord.ButtonStyle.primary, row=2)
+    async def nums(self, i, b):
+        await i.response.send_modal(NumbersModal("Délais et limites", [
+            ("delivered_close_min", "Fermeture après livraison (minutes)", "30"),
+            ("inactive_close_h", "Fermeture si inactif (heures, 0 = jamais)", "48"),
+            ("max_tickets", "Tickets max par membre (0 = illimité)", "1"),
+        ], TicketsPage))
+
+
+async def announce_restock(g, name, price, new):
+    ch = cfg_channel(g, "annonces_channel")
+    if not ch:
+        return
+    rid = cfg_int("ping_role")
+    emb = discord.Embed(title="📦 RESTOCK !", description=f"**{name}** — {price}\nStock : **{new}**\nOuvre un ticket pour commander !", color=0x22C55E)
+    try:
+        await ch.send(content=f"<@&{rid}>" if rid else None, embed=emb, allowed_mentions=discord.AllowedMentions(roles=True))
+    except discord.HTTPException:
+        pass
+
+
+def stock_text(stock):
+    return "♾️ illimité" if stock < 0 else ("❌ rupture" if stock == 0 else f"{stock} en stock")
+
+
+class ProductModal(discord.ui.Modal):
+    nom = discord.ui.TextInput(label="Nom du produit", max_length=100)
+    prix = discord.ui.TextInput(label="Prix (avec un nombre en €, ex : 5€)", max_length=50, placeholder="5€")
+    stock = discord.ui.TextInput(label="Stock (-1 = illimité)", max_length=7)
+    desc = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, max_length=300, required=False)
+
+    def __init__(self, pid=None):
+        super().__init__(title="Modifier le produit" if pid else "Nouveau produit")
+        self.pid = pid
+        p = q("SELECT * FROM products WHERE id=?", (pid,), one=True) if pid else None
+        self.nom.default = p["name"] if p else None
+        self.prix.default = p["price"] if p else None
+        self.stock.default = str(p["stock"]) if p else "-1"
+        self.desc.default = (p["description"] or None) if p else None
+
+    async def on_submit(self, i: discord.Interaction):
+        try:
+            stock = int(self.stock.value.strip())
+        except ValueError:
+            return await i.response.send_message("❌ Le stock doit être un nombre (-1 = illimité).", ephemeral=True)
+        name = self.nom.value.strip()
+        try:
+            if self.pid:
+                old = q("SELECT name FROM products WHERE id=?", (self.pid,), one=True)["name"]
+                ex("UPDATE products SET name=?, price=?, stock=?, description=? WHERE id=?",
+                   (name, self.prix.value.strip(), stock, self.desc.value.strip(), self.pid))
+                if old != name:
+                    ex("UPDATE categories SET product=? WHERE product=?", (name, old))
+                page = ProductEditPage(self.pid)
+            else:
+                ex("INSERT INTO products(name,price,stock,description) VALUES(?,?,?,?)",
+                   (name, self.prix.value.strip(), stock, self.desc.value.strip()))
+                page = ProductsPage()
+        except sqlite3.IntegrityError:
+            return await i.response.send_message("❌ Un produit porte déjà ce nom.", ephemeral=True)
+        await i.response.edit_message(embed=page.embed(i.guild), view=page)
+        await refresh_shop(i.guild)
+
+
+class RestockModal(discord.ui.Modal, title="Restock"):
+    qte = discord.ui.TextInput(label="Quantité à ajouter", max_length=6, placeholder="10")
+
+    def __init__(self, pid):
+        super().__init__()
+        self.pid = pid
+
+    async def on_submit(self, i: discord.Interaction):
+        try:
+            qte = int(self.qte.value.strip())
+            assert qte > 0
+        except (ValueError, AssertionError):
+            return await i.response.send_message("❌ Mets un nombre supérieur à 0.", ephemeral=True)
+        p = q("SELECT * FROM products WHERE id=?", (self.pid,), one=True)
+        new = qte if p["stock"] < 0 else p["stock"] + qte
+        ex("UPDATE products SET stock=? WHERE id=?", (new, self.pid))
+        page = ProductEditPage(self.pid)
+        await i.response.edit_message(embed=page.embed(i.guild), view=page)
+        await announce_restock(i.guild, p["name"], p["price"], new)
+        await refresh_shop(i.guild)
+
+
+class ProductsPage(Page):
+    def __init__(self):
+        super().__init__()
+        rows = q("SELECT * FROM products ORDER BY name LIMIT 25")
+        if rows:
+            sel = discord.ui.Select(
+                placeholder="✏️ Choisis un produit à modifier…", row=0,
+                options=[discord.SelectOption(label=p["name"][:100], value=str(p["id"]),
+                                              description=f"{p['price']} • {stock_text(p['stock'])}"[:100]) for p in rows])
+
+            async def pick(i: discord.Interaction):
+                await go(i, ProductEditPage(int(i.data["values"][0])))
+            sel.callback = pick
+            self.add_item(sel)
+
+    def embed(self, g):
+        rows = q("SELECT * FROM products ORDER BY name")
+        lines = [f"**{p['name']}** — {p['price']} • {stock_text(p['stock'])}" for p in rows]
+        return discord.Embed(title="🛍️ Produits", color=accent(),
+                             description="\n".join(lines) or "Aucun produit. Ajoutes-en un avec le bouton ci-dessous !")
+
+    @discord.ui.button(label="Ajouter un produit", emoji="➕", style=discord.ButtonStyle.success, row=1)
+    async def add(self, i, b):
+        await i.response.send_modal(ProductModal())
+
+
+class ProductEditPage(Page):
+    def __init__(self, pid):
+        super().__init__()
+        self.pid = pid
+
+    def back_view(self):
+        return ProductsPage()
+
+    def embed(self, g):
+        p = q("SELECT * FROM products WHERE id=?", (self.pid,), one=True)
+        if not p:
+            return discord.Embed(title="Produit introuvable", color=accent())
+        cats = ", ".join(c["label"] for c in q("SELECT label FROM categories WHERE product=?", (p["name"],)))
+        emb = discord.Embed(title=f"🛍️ {p['name']}", color=accent())
+        emb.add_field(name="Prix", value=p["price"])
+        emb.add_field(name="Stock", value=stock_text(p["stock"]))
+        emb.add_field(name="Description", value=p["description"] or "aucune", inline=False)
+        emb.add_field(name="Catégories liées (paiement auto)", value=cats or "aucune : ajoute une catégorie liée dans 🗂️ Catégories pour l'afficher dans le menu", inline=False)
+        return emb
+
+    @discord.ui.button(label="Modifier", emoji="✏️", style=discord.ButtonStyle.primary, row=0)
+    async def edit(self, i, b):
+        await i.response.send_modal(ProductModal(self.pid))
+
+    @discord.ui.button(label="Restock", emoji="📦", style=discord.ButtonStyle.success, row=0)
+    async def restock(self, i, b):
+        await i.response.send_modal(RestockModal(self.pid))
+
+    @discord.ui.button(label="Supprimer", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
+    async def delete(self, i: discord.Interaction, b):
+        p = q("SELECT name FROM products WHERE id=?", (self.pid,), one=True)
+        if p:
+            ex("UPDATE categories SET product=NULL WHERE product=?", (p["name"],))
+            ex("DELETE FROM products WHERE id=?", (self.pid,))
+        page = ProductsPage()
+        await i.response.edit_message(embed=page.embed(i.guild), view=page)
+        await refresh_shop(i.guild)
+
+
+class DeleteVouchModal(discord.ui.Modal, title="Supprimer un vouch"):
+    vid = discord.ui.TextInput(label="Numéro du vouch (#)", max_length=10, placeholder="12")
+
+    async def on_submit(self, i: discord.Interaction):
+        v = self.vid.value.strip().lstrip("#")
+        if not v.isdigit() or not q("SELECT 1 FROM vouches WHERE id=?", (int(v),), one=True):
+            return await i.response.send_message("❌ Vouch introuvable.", ephemeral=True)
+        ex("DELETE FROM vouches WHERE id=?", (int(v),))
+        page = VouchPage()
+        await i.response.edit_message(embed=page.embed(i.guild), view=page)
+
+
+class VouchPage(Page):
+    TOGGLES = [
+        ("vouch_client_only", "Réservé aux clients (rôle client)", "0"),
+        ("vouch_anywhere", "Autoriser /vouch hors d'un ticket", "1"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.add_toggles(self.TOGGLES, row=0)
+
+    def embed(self, g):
+        st = q("SELECT COUNT(*) n, AVG(stars) m FROM vouches", one=True)
+        emb = discord.Embed(title="⭐ Vouchs", color=accent(), description="Les vouchs sont postés dans le salon choisi dans 📍 Emplacements.")
+        emb.add_field(name="Salon", value=fmt_chan(g, "vouch_channel"))
+        emb.add_field(name="Délai entre 2 vouchs", value=("aucun" if not cfg_num("vouch_cooldown_h", 12) else f"{cfg_num('vouch_cooldown_h', 12):g} h"))
+        emb.add_field(name="Total", value=f"{st['n']} (moy. {st['m'] or 0:.2f}/5)")
+        last = q("SELECT * FROM vouches ORDER BY ts DESC LIMIT 6")
+        if last:
+            emb.add_field(name="Derniers vouchs", value="\n".join(
+                f"`#{v['id']}` {'⭐' * v['stars']} <@{v['author_id']}> : {v['text'][:40]}" for v in last), inline=False)
+        return emb
+
+    @discord.ui.button(label="Délai entre vouchs", emoji="⏱️", style=discord.ButtonStyle.primary, row=1)
+    async def delay(self, i, b):
+        await i.response.send_modal(NumbersModal("Délai entre vouchs", [
+            ("vouch_cooldown_h", "Heures entre 2 vouchs (0 = aucun)", "12")], VouchPage))
+
+    @discord.ui.button(label="Supprimer un vouch", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
+    async def delete(self, i, b):
+        await i.response.send_modal(DeleteVouchModal())
+
+
+TEXTS = {  # clé -> (nom, texte par défaut, variables disponibles, élément à republier)
+    "ticket_welcome": ("Accueil dans les tickets", DEFAULT_TICKET_WELCOME, "{user} {category} {product} {shop}", None),
+    "delivered_text": ("Message de livraison", DEFAULT_DELIVERED, "{user} {product} {shop}", None),
+    "paid_text": ("Message après paiement LTC", DEFAULT_PAID, "{user} {product} {shop}", None),
+    "welcome_text": ("Message de bienvenue", DEFAULT_WELCOME, "{achat} {vouchs} {shop}", "welcome"),
+    "rules_text": ("Règlement", DEFAULT_RULES, "", "rules"),
+}
+
+
+class TextModal(discord.ui.Modal):
+    def __init__(self, key):
+        label, default, vars_, item = TEXTS[key]
+        super().__init__(title=label[:45])
+        self.key, self.item = key, item
+        self.texte = discord.ui.TextInput(
+            label="Texte (vide = par défaut)", style=discord.TextStyle.paragraph, max_length=3500, required=False,
+            default=cfg_get(key) or default, placeholder=(f"Variables : {vars_}" if vars_ else None))
+        self.add_item(self.texte)
+
+    async def on_submit(self, i: discord.Interaction):
+        cfg_set(self.key, self.texte.value.strip())
+        await i.response.defer(ephemeral=True)
+        if self.item:
+            await publish(i.guild, self.item)
+        await i.followup.send(f"✅ « {TEXTS[self.key][0]} » mis à jour.", ephemeral=True)
+
+
+class TextsPage(Page):
+    def __init__(self):
+        super().__init__()
+        sel = discord.ui.Select(placeholder="✏️ Quel message modifier ?", row=0,
+                                options=[discord.SelectOption(label=v[0][:100], value=k) for k, v in TEXTS.items()])
+
+        async def pick(i: discord.Interaction):
+            await i.response.send_modal(TextModal(i.data["values"][0]))
+        sel.callback = pick
+        self.add_item(sel)
+
+    def embed(self, g):
+        emb = discord.Embed(title="💬 Textes", color=accent(),
+                            description="Choisis un message pour le modifier. Laisse le texte vide pour remettre celui par défaut.")
+        for k, (label, default, vars_, _) in TEXTS.items():
+            cur = cfg_get(k) or default
+            emb.add_field(name=label, value=cur[:150] + ("…" if len(cur) > 150 else "") + (f"\n`{vars_}`" if vars_ else ""), inline=False)
+        return emb
+
+
+class StatsPage(Page):
+    def embed(self, g):
+        now = time.time()
+        one = lambda sql, *a: q(sql, a, one=True)["n"]
+        emb = discord.Embed(title=f"📊 Stats {SHOP_NAME}", color=accent())
+        emb.add_field(name="Livrées (total)", value=str(one("SELECT COUNT(*) n FROM orders WHERE status='delivered'")))
+        emb.add_field(name="Livrées 7 jours", value=str(one("SELECT COUNT(*) n FROM orders WHERE status='delivered' AND delivered_ts > ?", now - 7 * 86400)))
+        emb.add_field(name="Livrées 24 h", value=str(one("SELECT COUNT(*) n FROM orders WHERE status='delivered' AND delivered_ts > ?", now - 86400)))
+        emb.add_field(name="Tickets ouverts", value=str(one("SELECT COUNT(*) n FROM orders WHERE status IN ('open','claimed') AND channel_id!=0")))
+        v = q("SELECT COUNT(*) n, AVG(stars) m FROM vouches", one=True)
+        emb.add_field(name="Vouchs", value=f"{v['n']} (moy. {v['m'] or 0:.2f}/5)")
+        emb.add_field(name="Encaissé en LTC", value=f"{q('SELECT COALESCE(SUM(ltc_eur),0) s FROM orders WHERE pay_state=2', one=True)['s']:.2f} €")
+        top = q("SELECT product, COUNT(*) n FROM orders WHERE status='delivered' GROUP BY product ORDER BY n DESC LIMIT 5")
+        if top:
+            emb.add_field(name="Top produits", value="\n".join(f"{t['product']} : {t['n']}" for t in top), inline=False)
+        return emb
+
+    @discord.ui.button(label="Rafraîchir", emoji="🔄", style=discord.ButtonStyle.primary, row=0)
+    async def reload(self, i, b):
+        await go(i, StatsPage())
+
+
+class BlacklistPage(Page):
+    def __init__(self):
+        super().__init__()
+        rows = q("SELECT * FROM blacklist LIMIT 25")
+        if rows:
+            sel = discord.ui.Select(
+                placeholder="✅ Retirer de la blacklist…", row=1,
+                options=[discord.SelectOption(label=str(r["user_id"]), value=str(r["user_id"]),
+                                              description=(r["reason"] or "")[:100] or None) for r in rows])
+
+            async def rm(i: discord.Interaction):
+                ex("DELETE FROM blacklist WHERE user_id=?", (int(i.data["values"][0]),))
+                await go(i, BlacklistPage())
+            sel.callback = rm
+            self.add_item(sel)
+
+    def embed(self, g):
+        rows = q("SELECT * FROM blacklist LIMIT 15")
+        return discord.Embed(title="⛔ Blacklist", color=accent(),
+                             description="\n".join(f"<@{r['user_id']}> — {r['reason'] or '—'}" for r in rows)
+                             or "Personne n'est blacklist. Les membres blacklist ne peuvent ni ouvrir de ticket ni vouch.")
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="⛔ Ajouter un membre à la blacklist", row=0)
+    async def add(self, i, sel):
+        for u in sel.values:
+            ex("INSERT OR REPLACE INTO blacklist(user_id,reason) VALUES(?,?)", (u.id, "Via /config"))
+        await go(i, BlacklistPage())
+
+
+BACKUP_TABLES = ["config", "products", "categories", "vouches", "blacklist"]
+
+
+def export_data():
+    return {"version": 3, "shop": SHOP_NAME, "exported": int(time.time()),
+            "tables": {t: [dict(r) for r in q(f"SELECT * FROM {t}")] for t in BACKUP_TABLES}}
+
+
+def restore_data(data):
+    tables = data["tables"]
+    _db.execute("BEGIN")
+    try:
+        for t in BACKUP_TABLES:
+            if t not in tables:
+                continue
+            cols = [r["name"] for r in q(f"PRAGMA table_info({t})")]
+            _db.execute(f"DELETE FROM {t}")
+            for row in tables[t]:
+                keys = [k for k in row if k in cols]
+                _db.execute(f"INSERT INTO {t}({','.join(keys)}) VALUES({','.join('?' * len(keys))})", [row[k] for k in keys])
+        _db.execute("COMMIT")
+    except Exception:
+        _db.execute("ROLLBACK")
+        raise
+    _cfg.clear()
+    for r in q("SELECT key,value FROM config"):
+        _cfg[r["key"]] = r["value"]
+
+
+class BackupPage(Page):
+    def embed(self, g):
+        return discord.Embed(
+            title="💾 Sauvegarde", color=accent(),
+            description=("Exporte toute ta config (rôles, salons, produits, catégories, textes, vouchs, blacklist) dans un fichier.\n\n"
+                         "**Pense à en faire une avant chaque redéploiement** : sur Render gratuit, le disque est effacé.\n"
+                         "Pour restaurer : `/restaurer` et joins le fichier."))
+
+    @discord.ui.button(label="Exporter la sauvegarde", emoji="💾", style=discord.ButtonStyle.success, row=0)
+    async def export(self, i: discord.Interaction, b):
+        data = json.dumps(export_data(), ensure_ascii=False, indent=1).encode()
+        await i.response.send_message("💾 Voici ta sauvegarde. Garde-la précieusement.", ephemeral=True,
+                                      file=discord.File(io.BytesIO(data), filename=f"sauvegarde-shop-{time.strftime('%Y%m%d-%H%M')}.json"))
 
 
 # ═════════════════════════ /help ═════════════════════════
@@ -1179,12 +1706,13 @@ def help_pages(member):
                              "`/vouch_supprimer` supprimer un vouch")
     if member.guild_permissions.administrator:
         pages["⚙️ Admin"] = ("⚙️ Commandes admin",
-                             "`/config` **grand panneau** : rôles, ping des tickets, salons, apparence, catégories, paiement, options\n"
+                             "`/config` **grand panneau** : tout se règle ici (rôles, emplacements, produits, catégories, textes, vouchs, tickets, paiement, stats, blacklist, sauvegarde)\n"
                              "`/creer_shop` crée tout le serveur (rôles, salons, règlement…)\n"
                              "`/setup` installe seulement la partie shop\n"
                              "`/panel_tickets` poste le panneau de tickets dans ce salon\n"
                              "`/set_ltc` définir l'adresse LTC\n"
-                             "`/staff_ajouter` donner le rôle staff")
+                             "`/staff_ajouter` donner le rôle staff\n"
+                             "`/restaurer` restaurer une sauvegarde (fichier JSON)")
     return pages
 
 
@@ -1242,7 +1770,8 @@ async def on_message(m: discord.Message):
     if m.author.bot or not m.guild or not isinstance(m.author, discord.Member):
         return
     o = order_of(m.channel.id)
-    if o and o["status"] == "open" and m.author.id != o["user_id"] and is_staff(m.author):
+    if (o and cfg_get("auto_claim", "1") == "1" and o["status"] == "open"
+            and m.author.id != o["user_id"] and is_staff(m.author)):
         ex("UPDATE orders SET status='claimed', staff_id=? WHERE id=?", (m.author.id, o["id"]))
         await m.channel.send(embed=discord.Embed(description=f"🙋 Ticket pris en charge par {m.author.mention}", color=accent()))
 
@@ -1253,7 +1782,7 @@ async def janitor():
     try:
         if cfg_get("auto_close_delivered", "1") == "1":
             for r in q("SELECT * FROM orders WHERE status='delivered' AND channel_id!=0 AND delivered_ts IS NOT NULL AND delivered_ts < ?",
-                       (now - DELIVERED_CLOSE_AFTER,)):
+                       (now - cfg_num("delivered_close_min", 30) * 60,)):
                 ch = bot.get_channel(r["channel_id"])
                 if ch:
                     await close_channel(ch, "auto : commande livrée")
@@ -1265,7 +1794,7 @@ async def janitor():
                 ex("UPDATE orders SET status='closed', channel_id=0 WHERE id=?", (r["id"],))
                 continue
             last = discord.utils.snowflake_time(ch.last_message_id).timestamp() if ch.last_message_id else ch.created_at.timestamp()
-            if now - last > INACTIVE_CLOSE_AFTER:
+            if cfg_num("inactive_close_h", 48) and now - last > cfg_num("inactive_close_h", 48) * 3600:
                 await close_channel(ch, "auto : inactif 48h")
     except Exception as e:
         print("janitor:", e)
@@ -1356,7 +1885,9 @@ async def do_setup(i: discord.Interaction, full: bool = False):
         cfg_set(key, r.id)
         return r
 
-    staff = await ensure_role("staff_role", "Staff Shop", 0x8B5CF6)
+    if not staff_roles(g):
+        await ensure_role("staff_role", "Staff Shop", 0x8B5CF6)
+    staff = staff_roles(g)[0]
     await ensure_role("client_role", "Client", 0x22C55E)
     await ensure_role("ping_role", "Restock", 0xF59E0B, mentionable=True)
     if cfg_get("ticket_ping_roles") is None:
@@ -1425,24 +1956,8 @@ async def do_setup(i: discord.Interaction, full: bool = False):
 
     await refresh_shop(g)
     if full:
-        buy, vch = cfg_int("panel_channel"), cfg_int("vouch_channel")
-        await _upsert(g, "welcome_channel", "welcome_msg", embed=discord.Embed(
-            title=f"👋 Bienvenue sur {SHOP_NAME} !",
-            description=(f"Ici tu trouves nos produits digitaux.\n\n🛒 Pour acheter : ouvre un ticket dans <#{buy}>\n"
-                         f"✅ Les avis de nos clients : <#{vch}>\n📜 Lis le règlement avant de commander."),
-            color=accent()))
-        await _upsert(g, "rules_channel", "rules_msg", embed=discord.Embed(
-            title="📜 Règlement",
-            description=(
-                "**1.** Respecte les membres et le staff.\n"
-                "**2.** Pas de spam, pas de pub, pas d'insultes.\n"
-                "**3.** Les achats se font **uniquement via un ticket**. Ne fais confiance à aucun message privé, "
-                "seul le staff dans ton ticket peut te vendre quelque chose.\n"
-                "**4.** Paie uniquement avec les moyens donnés par le bot dans ton ticket, en envoyant le montant exact.\n"
-                "**5.** Garde tes preuves (captures, txid) en cas de problème.\n"
-                "**6.** Après ta commande, laisse un vouch, ça aide tout le monde.\n\n"
-                "_Le staff peut sanctionner en cas de non-respect._"),
-            color=accent()))
+        await publish(g, "welcome")
+        await publish(g, "rules")
     await i.followup.send(
         "✅ **Shop installé !**\n"
         "• Salons, rôles (Staff Shop / Client / Restock), panneau et catalogue créés\n"
@@ -1457,6 +1972,23 @@ async def do_setup(i: discord.Interaction, full: bool = False):
 async def config_cmd(i: discord.Interaction):
     v = MainView()
     await i.response.send_message(embed=v.embed(i.guild), view=v, ephemeral=True)
+
+
+@tree.command(name="restaurer", description="Restaurer une sauvegarde exportée depuis /config (fichier JSON)")
+@admin
+async def restaurer(i: discord.Interaction, fichier: discord.Attachment):
+    if fichier.size > 8_000_000:
+        return await i.response.send_message("❌ Fichier trop gros.", ephemeral=True)
+    await i.response.defer(ephemeral=True)
+    try:
+        data = json.loads(await fichier.read())
+        if "tables" not in data:
+            raise ValueError("ce n'est pas une sauvegarde du bot")
+        restore_data(data)
+    except Exception as e:
+        return await i.followup.send(f"❌ Sauvegarde invalide : {e}", ephemeral=True)
+    await refresh_shop(i.guild)
+    await i.followup.send("✅ Sauvegarde restaurée (config, produits, catégories, vouchs, blacklist).", ephemeral=True)
 
 
 @tree.command(name="help", description="Aide et liste des commandes")
@@ -1504,7 +2036,7 @@ async def set_ltc(i: discord.Interaction, adresse: str):
 @tree.command(name="staff_ajouter", description="Donner le rôle staff à un membre")
 @admin
 async def staff_ajouter(i: discord.Interaction, membre: discord.Member):
-    r = i.guild.get_role(cfg_int("staff_role") or 0)
+    r = (staff_roles(i.guild) or [None])[0]
     if not r:
         return await i.response.send_message("Fais d'abord `/setup` ou choisis le rôle staff dans `/config`.", ephemeral=True)
     await membre.add_roles(r)
@@ -1535,6 +2067,8 @@ async def vouch(i: discord.Interaction, note: app_commands.Range[int, 1, 5], avi
                 vendeur: discord.Member = None, produit: str = None):
     if vendeur and vendeur.id == i.user.id:
         return await i.response.send_message("Tu ne peux pas te vouch toi-même 😅", ephemeral=True)
+    if cfg_get("vouch_anywhere", "1") == "0" and not order_of(i.channel.id):
+        return await i.response.send_message("Les vouchs se font depuis ton ticket (bouton ⭐ après la livraison).", ephemeral=True)
     err = check_vouch(i.user)
     if err:
         return await i.response.send_message(err, ephemeral=True)
