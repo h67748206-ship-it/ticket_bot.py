@@ -840,7 +840,7 @@ async def set_ltc(i: discord.Interaction, adresse: str):
 
 @tree.command(name="ltc_montant", description="Générer le paiement LTC de ce ticket à partir d'un prix en € (staff)")
 @staff_only()
-async def ltc_montant(i: discord.Interaction, euros: app_commands.Range[float, 0.5, 100000]):
+async def ltc_montant(i: discord.Interaction, euros: app_commands.Range[float, 0.5, 100000.0]):
     o = order_of(i.channel.id)
     if not o:
         return await i.response.send_message("À utiliser dans un ticket.", ephemeral=True)
